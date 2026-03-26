@@ -8,7 +8,11 @@
   "plugins": [
     {
       "name": "ai-agent-skills",
-      "description": "Reusable AI agent skills — GitHub secrets management, CI/CD patterns, and more"
+      "description": "Reusable AI agent skills — GitHub secrets management, CI/CD patterns, and more",
+      "source": {
+        "source": "github",
+        "repo": "Sassy-Dog/ai-agent-skills"
+      }
     }
   ]
 }
