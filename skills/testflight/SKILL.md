@@ -62,8 +62,8 @@ Look up the bundle ID from the project's iOS config. Common locations:
 
 ### Interpreting Results
 
-- **feedback**: Shake-to-report feedback from TestFlight testers (screenshots + comments). Note: Apple's `/betaFeedbacks` endpoint has limited availability — if it returns an error, inform the user that feedback may only be viewable in the App Store Connect web UI.
-- **testers**: Email, name, and invite type for all beta testers on the app.
+- **feedback**: Returns `screenshotSubmissions` and `crashSubmissions` arrays from Apple's v1 beta feedback endpoints. Screenshot submissions include tester comments, device info, and screenshot URLs (with expiration dates). Crash submissions include crash logs.
+- **testers**: Email, name, invite type, device info, and installed build version for all beta testers.
 - **builds**: Version, upload date, processing state, and expiration status.
 - **groups**: Beta group names, whether internal, and public link status.
 
@@ -72,10 +72,9 @@ Look up the bundle ID from the project's iOS config. Common locations:
 | Error | Action |
 |-------|--------|
 | Missing env vars | Tell user to add Apple credentials to Doppler |
-| HTTP 401 | API key may be revoked — regenerate in Apple Developer portal |
+| HTTP 401 | API key may be revoked — regenerate in Apple Developer portal. Also check that PyJWT is installed (`pip3 install pyjwt cryptography`) |
 | HTTP 403 | API key role insufficient — needs App Manager or Admin |
 | No app found | Bundle ID is wrong — try `raw /v1/apps` to list all apps |
-| betaFeedbacks error | Endpoint limited — direct user to App Store Connect UI |
 
 ## Additional Resources
 
@@ -85,4 +84,4 @@ Look up the bundle ID from the project's iOS config. Common locations:
 
 ### Scripts
 
-- **`scripts/appstore-connect.sh`** — Bundled query script with JWT generation, multi-command support, and error handling. Requires `openssl`, `curl`, `jq`, and `base64`.
+- **`scripts/appstore-connect.sh`** — Bundled query script with JWT generation, multi-command support, and error handling. Prefers `python3` with PyJWT for reliable ES256 JWT signing; falls back to `openssl` with DER-to-raw signature conversion. Requires `curl`, `jq`, and either `python3 + pyjwt` or `openssl + base64 + xxd`.

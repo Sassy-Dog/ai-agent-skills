@@ -3,7 +3,7 @@
 # App Store Connect API query tool
 # Generates an ES256 JWT and queries TestFlight-related endpoints.
 #
-# Requirements: openssl, curl, jq, base64
+# Requirements: python3 + PyJWT (preferred) OR openssl, curl, jq, base64
 # Env vars:
 #   APPLE_APP_STORE_CONNECT_API_KEY_ID
 #   APPLE_APP_STORE_CONNECT_ISSUER_ID
@@ -35,15 +35,63 @@ API_KEY_FILE="$TEMP_DIR/AuthKey_${KEY_ID}.p8"
 echo "$API_KEY_BASE64" | base64 --decode > "$API_KEY_FILE"
 
 # --- Generate JWT (ES256, 20-min expiry) ---
-b64url() { base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n'; }
+# openssl dgst -sign produces DER-encoded ECDSA signatures, but JWT ES256
+# requires raw R||S (two 32-byte integers concatenated). Python's PyJWT
+# handles this correctly, so prefer it when available.
+generate_jwt_python() {
+    python3 -c "
+import jwt, time, os, base64, sys
+key_pem = base64.b64decode(os.environ['APPLE_APP_STORE_CONNECT_API_KEY_BASE64'])
+print(jwt.encode(
+    {'iss': os.environ['APPLE_APP_STORE_CONNECT_ISSUER_ID'],
+     'iat': int(time.time()),
+     'exp': int(time.time()) + 1200,
+     'aud': 'appstoreconnect-v1'},
+    key_pem, algorithm='ES256',
+    headers={'kid': os.environ['APPLE_APP_STORE_CONNECT_API_KEY_ID']}))
+" 2>/dev/null
+}
 
-JWT_HEADER=$(echo -n '{"alg":"ES256","kid":"'"$KEY_ID"'","typ":"JWT"}' | b64url)
-ISSUED_AT=$(date +%s)
-EXPIRATION=$((ISSUED_AT + 1200))
-JWT_PAYLOAD=$(echo -n '{"iss":"'"$ISSUER_ID"'","iat":'"$ISSUED_AT"',"exp":'"$EXPIRATION"',"aud":"appstoreconnect-v1"}' | b64url)
-JWT_SIGNING_INPUT="$JWT_HEADER.$JWT_PAYLOAD"
-JWT_SIGNATURE=$(echo -n "$JWT_SIGNING_INPUT" | openssl dgst -binary -sha256 -sign "$API_KEY_FILE" | b64url)
-JWT="$JWT_SIGNING_INPUT.$JWT_SIGNATURE"
+generate_jwt_openssl() {
+    local b64url_encode
+    b64url_encode() { base64 | tr -d '=\n' | tr '/+' '_-'; }
+
+    # DER-to-raw: extract R and S integers from ASN.1 DER, pad/trim to 32 bytes each
+    der_to_raw() {
+        local hex r_len r_hex s_offset s_len s_hex
+        hex=$(xxd -p | tr -d '\n')
+        # DER: 30 <seq_len> 02 <r_len> <r_bytes> 02 <s_len> <s_bytes>
+        r_len=$((16#${hex:6:2}))
+        r_hex=${hex:8:$((r_len * 2))}
+        s_offset=$((8 + r_len * 2 + 2))
+        s_len=$((16#${hex:$s_offset:2}))
+        s_hex=${hex:$((s_offset + 2)):$((s_len * 2))}
+        # Pad to 32 bytes, trim leading zeros if longer
+        while [ ${#r_hex} -lt 64 ]; do r_hex="00$r_hex"; done
+        while [ ${#s_hex} -lt 64 ]; do s_hex="00$s_hex"; done
+        r_hex=${r_hex: -64}
+        s_hex=${s_hex: -64}
+        echo -n "${r_hex}${s_hex}" | xxd -r -p
+    }
+
+    local header payload signing_input signature
+    header=$(printf '{"alg":"ES256","kid":"%s","typ":"JWT"}' "$KEY_ID" | b64url_encode)
+    local iat exp
+    iat=$(date +%s)
+    exp=$((iat + 1200))
+    payload=$(printf '{"iss":"%s","iat":%d,"exp":%d,"aud":"appstoreconnect-v1"}' "$ISSUER_ID" "$iat" "$exp" | b64url_encode)
+    signing_input="$header.$payload"
+    signature=$(printf '%s' "$signing_input" | openssl dgst -binary -sha256 -sign "$API_KEY_FILE" | der_to_raw | b64url_encode)
+    echo "$signing_input.$signature"
+}
+
+# Prefer Python (reliable ES256), fall back to openssl with DER conversion
+if python3 -c "import jwt" 2>/dev/null; then
+    JWT=$(generate_jwt_python)
+else
+    echo "⚠️  PyJWT not found, using openssl (install with: pip3 install pyjwt cryptography)" >&2
+    JWT=$(generate_jwt_openssl)
+fi
 
 # --- API helper ---
 API_BASE="https://api.appstoreconnect.apple.com"
@@ -52,7 +100,8 @@ asc_get() {
     local url="$1"
     local response http_code body
 
-    response=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $JWT" "$url")
+    # -g disables curl's URL globbing (brackets in filter[field] params)
+    response=$(curl -sg -w "\n%{http_code}" -H "Authorization: Bearer $JWT" "$url")
     http_code=$(echo "$response" | tail -n1)
     body=$(echo "$response" | sed '$d')
 
@@ -90,21 +139,26 @@ case "$COMMAND" in
         echo "$BUILDS" | jq -r '.data[] | "  v\(.attributes.version) (\(.attributes.uploadedDate[:10])) — \(.attributes.processingState)"' >&2
         echo "" >&2
 
-        echo "===> Beta Feedback" >&2
-        FEEDBACK=$(asc_get "$API_BASE/v1/apps/$APP_ID/betaFeedbacks?limit=25&sort=-timestamp" 2>/dev/null || echo '{"errors":[]}')
-        FEEDBACK_COUNT=$(echo "$FEEDBACK" | jq '.data | length // 0' 2>/dev/null)
+        # Fetch screenshot feedback (shake-to-report with screenshots)
+        echo "===> Beta Feedback (Screenshots)" >&2
+        SCREENSHOT_FB=$(asc_get "$API_BASE/v1/apps/$APP_ID/betaFeedbackScreenshotSubmissions?limit=25" 2>/dev/null || echo '{"data":[]}')
+        SCREENSHOT_COUNT=$(echo "$SCREENSHOT_FB" | jq '.data | length' 2>/dev/null || echo 0)
+        echo "    $SCREENSHOT_COUNT screenshot submission(s)" >&2
 
-        if [[ "$FEEDBACK_COUNT" -gt 0 ]]; then
-            echo "$FEEDBACK" | jq '.'
+        # Fetch crash feedback (shake-to-report with crash logs)
+        echo "===> Beta Feedback (Crashes)" >&2
+        CRASH_FB=$(asc_get "$API_BASE/v1/apps/$APP_ID/betaFeedbackCrashSubmissions?limit=25" 2>/dev/null || echo '{"data":[]}')
+        CRASH_COUNT=$(echo "$CRASH_FB" | jq '.data | length' 2>/dev/null || echo 0)
+        echo "    $CRASH_COUNT crash submission(s)" >&2
+
+        TOTAL=$((SCREENSHOT_COUNT + CRASH_COUNT))
+        if [[ "$TOTAL" -gt 0 ]]; then
+            # Merge both feedback types into a single response
+            jq -n --argjson screenshots "$SCREENSHOT_FB" --argjson crashes "$CRASH_FB" \
+                '{ screenshotSubmissions: $screenshots.data, crashSubmissions: $crashes.data }'
         else
-            ERROR=$(echo "$FEEDBACK" | jq -r '.errors[0].title // empty' 2>/dev/null)
-            if [[ -n "$ERROR" ]]; then
-                echo "Note: betaFeedbacks endpoint returned: $ERROR" >&2
-                echo "Shake-to-report feedback may only be available in App Store Connect UI." >&2
-            else
-                echo "No beta feedback found." >&2
-            fi
-            echo '{"data":[]}'
+            echo "No beta feedback found." >&2
+            echo '{"screenshotSubmissions":[],"crashSubmissions":[]}'
         fi
         ;;
 
